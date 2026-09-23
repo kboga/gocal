@@ -38,6 +38,19 @@ I added a special category for 'exclude/include' called all_day, which filters a
  const UPSTREAM_URL =
   "https://github.com/othyn/go-calendar/releases/latest/download/gocal.ics";
 
+/*
+ * The Leek Duck data go-calendar is generated from. Its `eventID`
+ * equals the ICS UID, and its start/end end with `Z` for global
+ * (UTC) events, which the ICS itself does not preserve.
+ */
+const SCRAPEDDUCK_EVENTS_URL =
+  "https://raw.githubusercontent.com/bigfoott/ScrapedDuck/data/events.json";
+
+const MONTH_NAMES = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 const categories = {
   community_day: "[CD]",
   elite_raids: "[ER]",
@@ -67,6 +80,20 @@ type Category = keyof typeof categories;
 interface EventMetadata {
   category: Category | null;
   allDay: boolean;
+}
+
+interface GlobalEventTimes {
+  start: Date;
+  end: Date;
+}
+
+interface ZonedParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
 }
 
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
@@ -146,6 +173,9 @@ export default {
       );
     }
 
+    // Fetched in parallel; resolves to an empty map on failure.
+    const globalTimesPromise = fetchGlobalEventTimes();
+
     let upstream: Response;
 
     try {
@@ -195,6 +225,18 @@ export default {
         excludedCategories,
       );
     }
+
+    /*
+     * go-calendar turns multi-day global events into all-day
+     * events and only keeps their UTC times in the description,
+     * e.g. "Starts at 20:00, ends at 20:00.". Rewrite those
+     * times into the requested timezone.
+     */
+    calendar = localizeGlobalEventDescriptions(
+      calendar,
+      timezone,
+      await globalTimesPromise,
+    );
 
     /*
      * Convert floating local DATE-TIME values into UTC.
@@ -363,6 +405,254 @@ function matchesAnyFilter(
   });
 }
 
+/**
+ * Maps ScrapedDuck eventID -> UTC start/end, for global events only.
+ *
+ * Never throws: if ScrapedDuck is unavailable the calendar is
+ * served with its original descriptions.
+ */
+async function fetchGlobalEventTimes(): Promise<
+  Map<string, GlobalEventTimes>
+> {
+  const times = new Map<string, GlobalEventTimes>();
+
+  try {
+    const response = await fetch(SCRAPEDDUCK_EVENTS_URL, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "GO-Calendar-Cloudflare-Proxy",
+      },
+
+      cf: {
+        cacheEverything: true,
+        cacheTtl: 900,
+      },
+    });
+
+    if (!response.ok) {
+      return times;
+    }
+
+    const events: unknown = await response.json();
+
+    if (!Array.isArray(events)) {
+      return times;
+    }
+
+    for (const event of events) {
+      const { eventID, start, end } = event ?? {};
+
+      if (
+        typeof eventID !== "string" ||
+        !isUtcTimestamp(start) ||
+        !isUtcTimestamp(end)
+      ) {
+        continue;
+      }
+
+      times.set(eventID, {
+        start: new Date(start),
+        end: new Date(end),
+      });
+    }
+  } catch {
+    // Fall through with whatever was collected.
+  }
+
+  return times;
+}
+
+function isUtcTimestamp(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.endsWith("Z") &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
+function localizeGlobalEventDescriptions(
+  calendar: string,
+  timezone: string,
+  globalTimes: Map<string, GlobalEventTimes>,
+): string {
+  if (globalTimes.size === 0) {
+    return calendar;
+  }
+
+  return calendar.replace(
+    /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
+    (event) =>
+      localizeEventDescription(
+        event,
+        timezone,
+        globalTimes,
+      ),
+  );
+}
+
+function localizeEventDescription(
+  event: string,
+  timezone: string,
+  globalTimes: Map<string, GlobalEventTimes>,
+): string {
+  const unfolded = event.replace(/\n[ \t]/g, "");
+
+  const uid = unfolded.match(/^UID:(.*)$/m)?.[1];
+  const times = uid ? globalTimes.get(uid) : undefined;
+
+  if (!times) {
+    return event;
+  }
+
+  // Timed events already carry exact times; only all-day ones lose them.
+  const startDate = unfolded.match(
+    /^DTSTART;VALUE=DATE:(\d{8})$/m,
+  )?.[1];
+
+  const endDate = unfolded.match(
+    /^DTEND;VALUE=DATE:(\d{8})$/m,
+  )?.[1];
+
+  if (!startDate || !endDate) {
+    return event;
+  }
+
+  /*
+   * Only look before the VALARM, whose DESCRIPTION is the summary.
+   * The property may be folded over several lines.
+   */
+  const alarmPosition = event.indexOf("\nBEGIN:VALARM");
+
+  const eventProperties =
+    alarmPosition === -1
+      ? event
+      : event.slice(0, alarmPosition);
+
+  const descriptionLine = eventProperties.match(
+    /^DESCRIPTION(?:;[^:]*)?:.*(?:\n[ \t].*)*/m,
+  )?.[0];
+
+  if (!descriptionLine) {
+    return event;
+  }
+
+  const description = descriptionLine
+    .replace(/\n[ \t]/g, "")
+    .match(
+      /^(DESCRIPTION(?:;[^:]*)?:)Starts at (\d{2}:\d{2})\\, ends at (\d{2}:\d{2})\.(.*)$/,
+    );
+
+  if (!description) {
+    return event;
+  }
+
+  const [, property, describedStart, describedEnd, rest] =
+    description;
+
+  /*
+   * Only rewrite when the text really holds the UTC times, so
+   * this becomes a no-op if go-calendar ever fixes it upstream.
+   */
+  if (
+    describedStart !== formatUtcTime(times.start) ||
+    describedEnd !== formatUtcTime(times.end)
+  ) {
+    return event;
+  }
+
+  const start = getZonedParts(times.start, timezone);
+  const end = getZonedParts(times.end, timezone);
+
+  /*
+   * The all-day range is exclusive, so the last day shown is
+   * the day before DTEND. When the local times fall on other
+   * days than the ones shown, spell out the dates too.
+   */
+  const datesMatch =
+    formatIcsDate(start) === startDate &&
+    formatIcsDate(end) === previousIcsDate(endDate);
+
+  const text = datesMatch
+    ? `Starts at ${formatTime(start)}\\, ends at ${formatTime(end)} (${timezone}).`
+    : `Starts ${formatDayMonth(start)} at ${formatTime(start)}\\, ends ${formatDayMonth(end)} at ${formatTime(end)} (${timezone}).`;
+
+  return event.replace(
+    descriptionLine,
+    foldLine(`${property}${text}${rest}`),
+  );
+}
+
+function formatUtcTime(date: Date): string {
+  const pad = (number: number): string =>
+    String(number).padStart(2, "0");
+
+  return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+function formatTime(parts: ZonedParts): string {
+  const pad = (number: number): string =>
+    String(number).padStart(2, "0");
+
+  return `${pad(parts.hour)}:${pad(parts.minute)}`;
+}
+
+function formatDayMonth(parts: ZonedParts): string {
+  return `${parts.day} ${MONTH_NAMES[parts.month - 1]}`;
+}
+
+function formatIcsDate(parts: ZonedParts): string {
+  const pad = (number: number): string =>
+    String(number).padStart(2, "0");
+
+  return `${parts.year}${pad(parts.month)}${pad(parts.day)}`;
+}
+
+function previousIcsDate(value: string): string {
+  const date = new Date(
+    Date.UTC(
+      Number(value.slice(0, 4)),
+      Number(value.slice(4, 6)) - 1,
+      Number(value.slice(6, 8)) - 1,
+    ),
+  );
+
+  return formatUtcIcsDate(date).slice(0, 8);
+}
+
+/**
+ * RFC 5545 folding: lines of at most 75 octets, continuation
+ * lines start with a single space. Never splits a UTF-8 sequence.
+ */
+function foldLine(line: string): string {
+  const encoder = new TextEncoder();
+  const lines: string[] = [];
+
+  let current = "";
+  let size = 0;
+  let limit = 75;
+
+  for (const char of line) {
+    const charSize = encoder.encode(char).length;
+
+    if (size + charSize > limit) {
+      lines.push(current);
+      current = "";
+      size = 0;
+      // The leading space counts towards the 75 octets.
+      limit = 74;
+    }
+
+    current += char;
+    size += charSize;
+  }
+
+  lines.push(current);
+
+  return lines.join("\n ");
+}
+
 function convertFloatingTimesToUtc(
   calendar: string,
   timezone: string,
@@ -490,6 +780,27 @@ function getTimeZoneOffset(
   date: Date,
   timezone: string,
 ): number {
+  const parts = getZonedParts(date, timezone);
+
+  const representedAsUtc = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
+  );
+
+  return representedAsUtc - date.getTime();
+}
+
+/**
+ * The wall-clock components of an instant in a timezone.
+ */
+function getZonedParts(
+  date: Date,
+  timezone: string,
+): ZonedParts {
   const formatter =
     getTimeZoneFormatter(timezone);
 
@@ -501,16 +812,14 @@ function getTimeZoneOffset(
     }
   }
 
-  const representedAsUtc = Date.UTC(
-    Number(parts.year),
-    Number(parts.month) - 1,
-    Number(parts.day),
-    Number(parts.hour),
-    Number(parts.minute),
-    Number(parts.second),
-  );
-
-  return representedAsUtc - date.getTime();
+  return {
+    year: Number(parts.year),
+    month: Number(parts.month),
+    day: Number(parts.day),
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+    second: Number(parts.second),
+  };
 }
 
 function getTimeZoneFormatter(
