@@ -53,6 +53,7 @@ const MONTH_NAMES = [
 
 const categories = {
   community_day: "[CD]",
+  choose_your_path: "[CYP]",
   elite_raids: "[ER]",
   event: "[E]",
   go_battle_league: "[GBL]",
