@@ -104,8 +104,8 @@ const categories = {
   timed_research: { prefix: "[TR]", name: "Timed Research" },
   update: { prefix: "[U]", name: "Update" },
   wild_area: { prefix: "[WA]", name: "Wild Area" },
-  // Lowercase: reads naturally mid-sentence ("except all-day events").
-  all_day: { prefix: "all_day", name: "all-day events" },
+  // Lowercase: reads naturally mid-sentence ("except all-day").
+  all_day: { prefix: "all_day", name: "all-day" },
 } as const;
 
 type Category = keyof typeof categories;
@@ -1295,10 +1295,10 @@ function setCalendarName(
   let summary = "All Pokémon GO events";
 
   if (include.length > 0) {
-    selection = names(include);
+    selection = `In: ${names(include)}`;
     summary = `Only Pokémon GO events of type: ${names(include)}`;
   } else if (exclude.length > 0) {
-    selection = `Everything except ${names(exclude)}`;
+    selection = `Ex: ${names(exclude)}`;
     summary = `All Pokémon GO events except ${names(exclude)}`;
   }
 
