@@ -52,24 +52,41 @@ const MONTH_NAMES = [
 ];
 
 const categories = {
+  bonus_hour: "[BH]",
+  city_safari: "[CS]",
   community_day: "[CD]",
   choose_your_path: "[CYP]",
   elite_raids: "[ER]",
   event: "[E]",
+  giovanni_special_research: "[GSR]",
+  global_challenge: "[GC]",
   go_battle_league: "[GBL]",
   go_pass: "[GP]",
+  go_rocket_takeover: "[GRT]",
   limited_research: "[LR]",
+  live_event: "[LE]",
+  location_specific: "[LS]",
   max_battles: "[MB]",
-  max_monday: "[MM]",
+  max_mondays: "[MM]",
+  pokemon_go_fest: "[PGF]",
   pokemon_go_tour: "[PGT]",
   pokemon_spotlight_hour: "[PSH]",
+  pokestop_showcase: "[PS]",
+  potential_ultra_unlock: "[PUU]",
   raid_battles: "[RB]",
   raid_day: "[RD]",
   raid_hour: "[RH]",
+  raid_weekend: "[RW]",
   research_breakthrough: "[RBT]",
+  // Same prefix as raid_day; only told apart via ScrapedDuck's eventType.
+  research_day: "[RD]",
   research: "[R]",
+  safari_zone: "[SZ]",
   season: "[S]",
+  special_research: "[SR]",
   team_go_rocket: "[TGR]",
+  ticketed_event: "[TE]",
+  ticketed: "[T]",
   timed_research: "[TR]",
   update: "[U]",
   wild_area: "[WA]",
@@ -86,6 +103,12 @@ interface EventMetadata {
 interface GlobalEventTimes {
   start: Date;
   end: Date;
+}
+
+interface ScrapedDuckEvent {
+  type: string;
+  // Only set for global (UTC) events.
+  times: GlobalEventTimes | null;
 }
 
 interface ZonedParts {
@@ -175,7 +198,7 @@ export default {
     }
 
     // Fetched in parallel; resolves to an empty map on failure.
-    const globalTimesPromise = fetchGlobalEventTimes();
+    const scrapedDuckPromise = fetchScrapedDuckEvents();
 
     let upstream: Response;
 
@@ -216,6 +239,8 @@ export default {
     // Work internally with LF.
     calendar = calendar.replace(/\r\n/g, "\n");
 
+    const scrapedDuckEvents = await scrapedDuckPromise;
+
     if (
       includedCategories.length > 0 ||
       excludedCategories.length > 0
@@ -224,6 +249,7 @@ export default {
         calendar,
         includedCategories,
         excludedCategories,
+        scrapedDuckEvents,
       );
     }
 
@@ -236,7 +262,7 @@ export default {
     calendar = localizeGlobalEventDescriptions(
       calendar,
       timezone,
-      await globalTimesPromise,
+      scrapedDuckEvents,
     );
 
     /*
@@ -325,11 +351,15 @@ function filterEvents(
   calendar: string,
   include: Category[],
   exclude: Category[],
+  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
 ): string {
   return calendar.replace(
     /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
     (event) => {
-      const metadata = getEventMetadata(event);
+      const metadata = getEventMetadata(
+        event,
+        scrapedDuckEvents,
+      );
 
       if (include.length > 0) {
         return matchesAnyFilter(metadata, include)
@@ -350,6 +380,7 @@ function filterEvents(
 
 function getEventMetadata(
   event: string,
+  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
 ): EventMetadata {
   /*
    * Unfold iCalendar continuation lines for inspection only.
@@ -363,18 +394,33 @@ function getEventMetadata(
 
   const summary = summaryMatch?.[1] ?? "";
 
-  let category: Category | null = null;
+  const uid = unfolded.match(/^UID:(.*)$/m)?.[1];
 
-  for (const [name, prefix] of Object.entries(
-    categories,
-  ) as Array<[Category, string]>) {
-    if (name === "all_day") {
-      continue;
-    }
+  const eventType = uid
+    ? scrapedDuckEvents.get(uid)?.type
+    : undefined;
 
-    if (summary.startsWith(prefix)) {
-      category = name;
-      break;
+  /*
+   * Prefer ScrapedDuck's eventType: prefixes are ambiguous
+   * ([RD] is both Raid Day and Research Day). Fall back to the
+   * prefix for events ScrapedDuck no longer lists.
+   */
+  let category: Category | null = eventType
+    ? categoryForEventType(eventType)
+    : null;
+
+  if (!category) {
+    for (const [name, prefix] of Object.entries(
+      categories,
+    ) as Array<[Category, string]>) {
+      if (name === "all_day") {
+        continue;
+      }
+
+      if (summary.startsWith(prefix)) {
+        category = name;
+        break;
+      }
     }
   }
 
@@ -393,6 +439,19 @@ function getEventMetadata(
   };
 }
 
+/**
+ * Category keys are ScrapedDuck eventTypes in snake_case.
+ */
+function categoryForEventType(
+  eventType: string,
+): Category | null {
+  const key = eventType.replace(/-/g, "_");
+
+  return isCategory(key) && key !== "all_day"
+    ? key
+    : null;
+}
+
 function matchesAnyFilter(
   metadata: EventMetadata,
   filters: Category[],
@@ -407,15 +466,17 @@ function matchesAnyFilter(
 }
 
 /**
- * Maps ScrapedDuck eventID -> UTC start/end, for global events only.
+ * Maps ScrapedDuck eventID -> eventType, plus UTC start/end
+ * for global events.
  *
  * Never throws: if ScrapedDuck is unavailable the calendar is
- * served with its original descriptions.
+ * served with its original descriptions and prefix-based
+ * categories.
  */
-async function fetchGlobalEventTimes(): Promise<
-  Map<string, GlobalEventTimes>
+async function fetchScrapedDuckEvents(): Promise<
+  Map<string, ScrapedDuckEvent>
 > {
-  const times = new Map<string, GlobalEventTimes>();
+  const scrapedDuckEvents = new Map<string, ScrapedDuckEvent>();
 
   try {
     const response = await fetch(SCRAPEDDUCK_EVENTS_URL, {
@@ -431,36 +492,38 @@ async function fetchGlobalEventTimes(): Promise<
     });
 
     if (!response.ok) {
-      return times;
+      return scrapedDuckEvents;
     }
 
     const events: unknown = await response.json();
 
     if (!Array.isArray(events)) {
-      return times;
+      return scrapedDuckEvents;
     }
 
     for (const event of events) {
-      const { eventID, start, end } = event ?? {};
+      const { eventID, eventType, start, end } = event ?? {};
 
       if (
         typeof eventID !== "string" ||
-        !isUtcTimestamp(start) ||
-        !isUtcTimestamp(end)
+        typeof eventType !== "string"
       ) {
         continue;
       }
 
-      times.set(eventID, {
-        start: new Date(start),
-        end: new Date(end),
+      scrapedDuckEvents.set(eventID, {
+        type: eventType,
+        times:
+          isUtcTimestamp(start) && isUtcTimestamp(end)
+            ? { start: new Date(start), end: new Date(end) }
+            : null,
       });
     }
   } catch {
     // Fall through with whatever was collected.
   }
 
-  return times;
+  return scrapedDuckEvents;
 }
 
 function isUtcTimestamp(
@@ -476,9 +539,9 @@ function isUtcTimestamp(
 function localizeGlobalEventDescriptions(
   calendar: string,
   timezone: string,
-  globalTimes: Map<string, GlobalEventTimes>,
+  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
 ): string {
-  if (globalTimes.size === 0) {
+  if (scrapedDuckEvents.size === 0) {
     return calendar;
   }
 
@@ -488,7 +551,7 @@ function localizeGlobalEventDescriptions(
       localizeEventDescription(
         event,
         timezone,
-        globalTimes,
+        scrapedDuckEvents,
       ),
   );
 }
@@ -496,12 +559,12 @@ function localizeGlobalEventDescriptions(
 function localizeEventDescription(
   event: string,
   timezone: string,
-  globalTimes: Map<string, GlobalEventTimes>,
+  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
 ): string {
   const unfolded = event.replace(/\n[ \t]/g, "");
 
   const uid = unfolded.match(/^UID:(.*)$/m)?.[1];
-  const times = uid ? globalTimes.get(uid) : undefined;
+  const times = uid ? scrapedDuckEvents.get(uid)?.times : undefined;
 
   if (!times) {
     return event;
