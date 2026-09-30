@@ -46,6 +46,16 @@ I added a special category for 'exclude/include' called all_day, which filters a
 const SCRAPEDDUCK_EVENTS_URL =
   "https://raw.githubusercontent.com/bigfoott/ScrapedDuck/data/events.json";
 
+/*
+ * Leek Duck tags some events on their own page only (e.g.
+ * "Location-specific"), not in the events list ScrapedDuck
+ * scrapes. A cron job reads those tags into KV a few pages at
+ * a time, to stay within the Free plan's 50 subrequests.
+ */
+const EVENT_TAGS_KEY = "event-tags";
+const TAG_BATCH_SIZE = 10;
+const TAG_RECHECK_MS = 24 * 60 * 60 * 1000;
+
 const MONTH_NAMES = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -97,8 +107,18 @@ type Category = keyof typeof categories;
 
 interface EventMetadata {
   category: Category | null;
+  // Categories from the event page's tags, e.g. location_specific.
+  tagCategories: Category[];
   allDay: boolean;
 }
+
+interface StoredEventTags {
+  // Leek Duck tag classes, e.g. ["event", "location-specific"].
+  tags: string[];
+  checkedAt: number;
+}
+
+type EventTagStore = Record<string, StoredEventTags>;
 
 interface GlobalEventTimes {
   start: Date;
@@ -199,6 +219,7 @@ export default {
 
     // Fetched in parallel; resolves to an empty map on failure.
     const scrapedDuckPromise = fetchScrapedDuckEvents();
+    const eventTagsPromise = readEventTags(env);
 
     let upstream: Response;
 
@@ -240,6 +261,7 @@ export default {
     calendar = calendar.replace(/\r\n/g, "\n");
 
     const scrapedDuckEvents = await scrapedDuckPromise;
+    const eventTags = await eventTagsPromise;
 
     if (
       includedCategories.length > 0 ||
@@ -250,6 +272,7 @@ export default {
         includedCategories,
         excludedCategories,
         scrapedDuckEvents,
+        eventTags,
       );
     }
 
@@ -315,6 +338,10 @@ export default {
       headers,
     });
   },
+
+  async scheduled(controller, env, ctx): Promise<void> {
+    ctx.waitUntil(refreshEventTags(env));
+  },
 } satisfies ExportedHandler<Env>;
 
 /**
@@ -352,6 +379,7 @@ function filterEvents(
   include: Category[],
   exclude: Category[],
   scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
+  eventTags: EventTagStore,
 ): string {
   return calendar.replace(
     /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
@@ -359,6 +387,7 @@ function filterEvents(
       const metadata = getEventMetadata(
         event,
         scrapedDuckEvents,
+        eventTags,
       );
 
       if (include.length > 0) {
@@ -381,6 +410,7 @@ function filterEvents(
 function getEventMetadata(
   event: string,
   scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
+  eventTags: EventTagStore,
 ): EventMetadata {
   /*
    * Unfold iCalendar continuation lines for inspection only.
@@ -425,6 +455,14 @@ function getEventMetadata(
   }
 
   /*
+   * Leek Duck's tag classes are its eventType names, so they
+   * map onto categories the same way.
+   */
+  const tagCategories = (uid ? eventTags[uid]?.tags ?? [] : [])
+    .map(categoryForEventType)
+    .filter((tag): tag is Category => tag !== null);
+
+  /*
    * An all-day DTSTART contains only YYYYMMDD,
    * possibly together with VALUE=DATE.
    */
@@ -435,6 +473,7 @@ function getEventMetadata(
 
   return {
     category,
+    tagCategories,
     allDay,
   };
 }
@@ -461,8 +500,148 @@ function matchesAnyFilter(
       return metadata.allDay;
     }
 
-    return metadata.category === filter;
+    return (
+      metadata.category === filter ||
+      metadata.tagCategories.includes(filter)
+    );
   });
+}
+
+async function readEventTags(
+  env: Env,
+): Promise<EventTagStore> {
+  try {
+    return (
+      (await env.EVENT_TAGS.get<EventTagStore>(
+        EVENT_TAGS_KEY,
+        {
+          type: "json",
+          cacheTtl: 300,
+        },
+      )) ?? {}
+    );
+  } catch {
+    // Tags are an extra; categories still work without them.
+    return {};
+  }
+}
+
+/**
+ * Checks the Leek Duck pages of up to TAG_BATCH_SIZE events that
+ * were never checked or not in the last TAG_RECHECK_MS, since
+ * tags can be added after an event is announced.
+ */
+async function refreshEventTags(
+  env: Env,
+): Promise<void> {
+  const scrapedDuckEvents = await fetchScrapedDuckEvents();
+
+  // Don't wipe the store because ScrapedDuck is unavailable.
+  if (scrapedDuckEvents.size === 0) {
+    return;
+  }
+
+  const stored =
+    (await env.EVENT_TAGS.get<EventTagStore>(
+      EVENT_TAGS_KEY,
+      "json",
+    )) ?? {};
+
+  const now = Date.now();
+  const store: EventTagStore = {};
+
+  // Drop events ScrapedDuck no longer lists.
+  for (const eventID of scrapedDuckEvents.keys()) {
+    if (stored[eventID]) {
+      store[eventID] = stored[eventID];
+    }
+  }
+
+  const checkedAt = (eventID: string): number =>
+    store[eventID]?.checkedAt ?? 0;
+
+  // Never-checked events first (checkedAt 0), then the oldest.
+  const due = [...scrapedDuckEvents.keys()]
+    .filter(
+      (eventID) =>
+        checkedAt(eventID) < now - TAG_RECHECK_MS,
+    )
+    .sort((a, b) => checkedAt(a) - checkedAt(b))
+    .slice(0, TAG_BATCH_SIZE);
+
+  const results = await Promise.all(
+    due.map(async (eventID) => ({
+      eventID,
+      tags: await fetchLeekDuckTags(eventID),
+    })),
+  );
+
+  for (const { eventID, tags } of results) {
+    // On failure keep the old entry, so it is retried next run.
+    if (tags) {
+      store[eventID] = { tags, checkedAt: now };
+    }
+  }
+
+  const pruned =
+    Object.keys(store).length !==
+    Object.keys(stored).length;
+
+  if (pruned || results.some(({ tags }) => tags)) {
+    await env.EVENT_TAGS.put(
+      EVENT_TAGS_KEY,
+      JSON.stringify(store),
+    );
+  }
+}
+
+/**
+ * The tag classes of a Leek Duck event page:
+ *
+ * <div class="page-tags"><div class="tag event">Event</div>
+ * <div class="tag location-specific">Location-specific</div></div>
+ *
+ * Returns null when the page can't be read or has no tags block,
+ * e.g. after a Leek Duck redesign.
+ */
+async function fetchLeekDuckTags(
+  eventID: string,
+): Promise<string[] | null> {
+  try {
+    const response = await fetch(
+      `https://leekduck.com/events/${encodeURIComponent(eventID)}/`,
+      {
+        headers: {
+          "User-Agent": "GO-Calendar-Cloudflare-Proxy",
+        },
+      },
+    );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const html = await response.text();
+    const start = html.indexOf('class="page-tags"');
+
+    if (start === -1) {
+      return null;
+    }
+
+    // Only the tags block, not "tag" classes elsewhere on the page.
+    const end = html.indexOf("<section", start);
+
+    const block = html.slice(
+      start,
+      end === -1 ? start + 2000 : end,
+    );
+
+    return [
+      ...block.matchAll(/class="tag ([a-z0-9-]+)"/g),
+    ].map((match) => match[1]);
+  } catch {
+    return null;
+  }
 }
 
 /**
