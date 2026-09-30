@@ -276,6 +276,13 @@ export default {
       );
     }
 
+    // After filtering, which still matches go-calendar's prefixes.
+    calendar = addTagPrefixes(
+      calendar,
+      scrapedDuckEvents,
+      eventTags,
+    );
+
     /*
      * go-calendar turns multi-day global events into all-day
      * events and only keeps their UTC times in the description,
@@ -489,6 +496,85 @@ function categoryForEventType(
   return isCategory(key) && key !== "all_day"
     ? key
     : null;
+}
+
+/*
+ * Adds a prefix for each page tag besides the event's own
+ * category, e.g. "[E] Patterns of the Wild" becomes
+ * "[E][LS] Patterns of the Wild". The alarm, whose DESCRIPTION
+ * repeats the title, is updated to match.
+ */
+function addTagPrefixes(
+  calendar: string,
+  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
+  eventTags: EventTagStore,
+): string {
+  return calendar.replace(
+    /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
+    (event) => {
+      const { category, tagCategories } = getEventMetadata(
+        event,
+        scrapedDuckEvents,
+        eventTags,
+      );
+
+      const extra = [...new Set(tagCategories)]
+        .filter((tag) => tag !== category)
+        .map((tag) => categories[tag]);
+
+      if (extra.length === 0) {
+        return event;
+      }
+
+      const alarmPosition = event.indexOf("\nBEGIN:VALARM");
+
+      const eventProperties =
+        alarmPosition === -1
+          ? event
+          : event.slice(0, alarmPosition);
+
+      const alarms =
+        alarmPosition === -1
+          ? ""
+          : event.slice(alarmPosition);
+
+      // May be folded over several lines.
+      const summaryLine = eventProperties.match(
+        /^SUMMARY(?:;[^:]*)?:.*(?:\n[ \t].*)*/m,
+      )?.[0];
+
+      if (!summaryLine) {
+        return event;
+      }
+
+      const [, property, title] =
+        summaryLine
+          .replace(/\n[ \t]/g, "")
+          .match(/^(SUMMARY(?:;[^:]*)?:)(.*)$/) ?? [];
+
+      // Insert after go-calendar's own "[XX]" prefix, if any.
+      const taggedTitle = title.replace(
+        /^(\[[^\]]+\])? ?/,
+        (_, prefix: string = "") =>
+          `${prefix}${extra.join("")} `,
+      );
+
+      const taggedAlarms = alarms.replace(
+        /^(DESCRIPTION(?:;[^:]*)?:)(.*(?:\n[ \t].*)*)/gm,
+        (line, alarmProperty: string, value: string) =>
+          value.replace(/\n[ \t]/g, "") === title
+            ? foldLine(`${alarmProperty}${taggedTitle}`)
+            : line,
+      );
+
+      return (
+        eventProperties.replace(
+          summaryLine,
+          () => foldLine(`${property}${taggedTitle}`),
+        ) + taggedAlarms
+      );
+    },
+  );
 }
 
 function matchesAnyFilter(
