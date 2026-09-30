@@ -104,8 +104,7 @@ const categories = {
   timed_research: { prefix: "[TR]", name: "Timed Research" },
   update: { prefix: "[U]", name: "Update" },
   wild_area: { prefix: "[WA]", name: "Wild Area" },
-  // Lowercase: reads naturally mid-sentence ("except all-day").
-  all_day: { prefix: "all_day", name: "all-day" },
+  all_day: { prefix: "all_day", name: "All-day" },
 } as const;
 
 type Category = keyof typeof categories;
@@ -1278,7 +1277,7 @@ function setCalendarTimezone(
 /**
  * Replaces go-calendar's "GO Calendar - Everything" name and
  * description with ones that describe the filters, e.g.
- * "GO - Everything except Season, Research".
+ * "GO - Ex: Season, Research".
  */
 function setCalendarName(
   calendar: string,
@@ -1286,20 +1285,28 @@ function setCalendarName(
   exclude: Category[],
   timezone: string,
 ): string {
-  const names = (list: Category[]): string =>
-    list
-      .map((category) => categories[category].name)
-      .join(", ");
+  const names = (list: Category[]): string[] =>
+    list.map((category) => categories[category].name);
+
+  // "A, B and C", so the list's end is clear mid-sentence.
+  const sentenceList = (list: Category[]): string => {
+    const all = names(list);
+    const last = all.pop();
+
+    return all.length > 0
+      ? `${all.join(", ")} and ${last}`
+      : last ?? "";
+  };
 
   let selection = "Everything";
   let summary = "All Pokémon GO events";
 
   if (include.length > 0) {
-    selection = `In: ${names(include)}`;
-    summary = `Only Pokémon GO events of type: ${names(include)}`;
+    selection = `In: ${names(include).join(", ")}`;
+    summary = `Only Pokémon GO events of type: ${sentenceList(include)}`;
   } else if (exclude.length > 0) {
-    selection = `Ex: ${names(exclude)}`;
-    summary = `All Pokémon GO events except ${names(exclude)}`;
+    selection = `Ex: ${names(exclude).join(", ")}`;
+    summary = `All Pokémon GO events except ${sentenceList(exclude)}`;
   }
 
   const name = `GO - ${capitalize(selection)}`;
