@@ -1278,7 +1278,7 @@ function setCalendarTimezone(
 /**
  * Replaces go-calendar's "GO Calendar - Everything" name and
  * description with ones that describe the filters, e.g.
- * "GO Calendar - Everything except Season, Research".
+ * "POGO - Everything except Season, Research".
  */
 function setCalendarName(
   calendar: string,
@@ -1296,7 +1296,7 @@ function setCalendarName(
 
   if (include.length > 0) {
     selection = names(include);
-    summary = `Only ${names(include)} from GO Calendar`;
+    summary = `Only Pokémon GO events of type: ${names(include)}`;
   } else if (exclude.length > 0) {
     selection = `Everything except ${names(exclude)}`;
     summary = `All Pokémon GO events except ${names(exclude)}`;
