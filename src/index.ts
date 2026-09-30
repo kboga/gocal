@@ -1302,7 +1302,7 @@ function setCalendarName(
     summary = `All Pokémon GO events except ${names(exclude)}`;
   }
 
-  const name = `GO Calendar - ${capitalize(selection)}`;
+  const name = `POGO - ${capitalize(selection)}`;
 
   const description =
     `${summary}, auto-updated and sourced from Leek Duck. ` +
