@@ -61,46 +61,51 @@ const MONTH_NAMES = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+/*
+ * prefix: go-calendar's title prefix (an acronym of Leek Duck's
+ * heading). name: Leek Duck's heading, used in the calendar name.
+ */
 const categories = {
-  bonus_hour: "[BH]",
-  city_safari: "[CS]",
-  community_day: "[CD]",
-  choose_your_path: "[CYP]",
-  elite_raids: "[ER]",
-  event: "[E]",
-  giovanni_special_research: "[GSR]",
-  global_challenge: "[GC]",
-  go_battle_league: "[GBL]",
-  go_pass: "[GP]",
-  go_rocket_takeover: "[GRT]",
-  limited_research: "[LR]",
-  live_event: "[LE]",
-  location_specific: "[LS]",
-  max_battles: "[MB]",
-  max_mondays: "[MM]",
-  pokemon_go_fest: "[PGF]",
-  pokemon_go_tour: "[PGT]",
-  pokemon_spotlight_hour: "[PSH]",
-  pokestop_showcase: "[PS]",
-  potential_ultra_unlock: "[PUU]",
-  raid_battles: "[RB]",
-  raid_day: "[RD]",
-  raid_hour: "[RH]",
-  raid_weekend: "[RW]",
-  research_breakthrough: "[RBT]",
+  bonus_hour: { prefix: "[BH]", name: "Bonus Hour" },
+  city_safari: { prefix: "[CS]", name: "City Safari" },
+  community_day: { prefix: "[CD]", name: "Community Day" },
+  choose_your_path: { prefix: "[CYP]", name: "Choose Your Path" },
+  elite_raids: { prefix: "[ER]", name: "Elite Raids" },
+  event: { prefix: "[E]", name: "Event" },
+  giovanni_special_research: { prefix: "[GSR]", name: "Giovanni Special Research" },
+  global_challenge: { prefix: "[GC]", name: "Global Challenge" },
+  go_battle_league: { prefix: "[GBL]", name: "GO Battle League" },
+  go_pass: { prefix: "[GP]", name: "GO Pass" },
+  go_rocket_takeover: { prefix: "[GRT]", name: "GO Rocket Takeover" },
+  limited_research: { prefix: "[LR]", name: "Limited Research" },
+  live_event: { prefix: "[LE]", name: "Live Event" },
+  location_specific: { prefix: "[LS]", name: "Location-specific" },
+  max_battles: { prefix: "[MB]", name: "Max Battles" },
+  max_mondays: { prefix: "[MM]", name: "Max Mondays" },
+  pokemon_go_fest: { prefix: "[PGF]", name: "Pokémon GO Fest" },
+  pokemon_go_tour: { prefix: "[PGT]", name: "Pokémon GO Tour" },
+  pokemon_spotlight_hour: { prefix: "[PSH]", name: "Pokémon Spotlight Hour" },
+  pokestop_showcase: { prefix: "[PS]", name: "PokéStop Showcase" },
+  potential_ultra_unlock: { prefix: "[PUU]", name: "Potential Ultra Unlock" },
+  raid_battles: { prefix: "[RB]", name: "Raid Battles" },
+  raid_day: { prefix: "[RD]", name: "Raid Day" },
+  raid_hour: { prefix: "[RH]", name: "Raid Hour" },
+  raid_weekend: { prefix: "[RW]", name: "Raid Weekend" },
+  research_breakthrough: { prefix: "[RBT]", name: "Research Breakthrough" },
   // Same prefix as raid_day; only told apart via ScrapedDuck's eventType.
-  research_day: "[RD]",
-  research: "[R]",
-  safari_zone: "[SZ]",
-  season: "[S]",
-  special_research: "[SR]",
-  team_go_rocket: "[TGR]",
-  ticketed_event: "[TE]",
-  ticketed: "[T]",
-  timed_research: "[TR]",
-  update: "[U]",
-  wild_area: "[WA]",
-  all_day: "all_day",
+  research_day: { prefix: "[RD]", name: "Research Day" },
+  research: { prefix: "[R]", name: "Research" },
+  safari_zone: { prefix: "[SZ]", name: "Safari Zone" },
+  season: { prefix: "[S]", name: "Season" },
+  special_research: { prefix: "[SR]", name: "Special Research" },
+  team_go_rocket: { prefix: "[TGR]", name: "Team GO Rocket" },
+  ticketed_event: { prefix: "[TE]", name: "Ticketed Event" },
+  ticketed: { prefix: "[T]", name: "Ticketed" },
+  timed_research: { prefix: "[TR]", name: "Timed Research" },
+  update: { prefix: "[U]", name: "Update" },
+  wild_area: { prefix: "[WA]", name: "Wild Area" },
+  // Lowercase: reads naturally mid-sentence ("except all-day events").
+  all_day: { prefix: "all_day", name: "all-day events" },
 } as const;
 
 type Category = keyof typeof categories;
@@ -319,6 +324,13 @@ export default {
       timezone,
     );
 
+    calendar = setCalendarName(
+      calendar,
+      includedCategories,
+      excludedCategories,
+      timezone,
+    );
+
     // RFC 5545 uses CRLF line endings.
     calendar = calendar.replace(/\n/g, "\r\n");
 
@@ -447,9 +459,9 @@ function getEventMetadata(
     : null;
 
   if (!category) {
-    for (const [name, prefix] of Object.entries(
+    for (const [name, { prefix }] of Object.entries(
       categories,
-    ) as Array<[Category, string]>) {
+    ) as Array<[Category, { prefix: string }]>) {
       if (name === "all_day") {
         continue;
       }
@@ -520,7 +532,7 @@ function addTagPrefixes(
 
       const extra = [...new Set(tagCategories)]
         .filter((tag) => tag !== category)
-        .map((tag) => categories[tag]);
+        .map((tag) => categories[tag].prefix);
 
       if (extra.length === 0) {
         return event;
@@ -1260,6 +1272,81 @@ function setCalendarTimezone(
     calendar.slice(0, eventPosition) +
     `X-WR-TIMEZONE:${timezone}\n` +
     calendar.slice(eventPosition)
+  );
+}
+
+/**
+ * Replaces go-calendar's "GO Calendar - Everything" name and
+ * description with ones that describe the filters, e.g.
+ * "GO Calendar - Everything except Season, Research".
+ */
+function setCalendarName(
+  calendar: string,
+  include: Category[],
+  exclude: Category[],
+  timezone: string,
+): string {
+  const names = (list: Category[]): string =>
+    list
+      .map((category) => categories[category].name)
+      .join(", ");
+
+  let selection = "Everything";
+  let summary = "All Pokémon GO events";
+
+  if (include.length > 0) {
+    selection = names(include);
+    summary = `Only ${names(include)} from GO Calendar`;
+  } else if (exclude.length > 0) {
+    selection = `Everything except ${names(exclude)}`;
+    summary = `All Pokémon GO events except ${names(exclude)}`;
+  }
+
+  const name = `GO Calendar - ${capitalize(selection)}`;
+
+  const description =
+    `${summary}, auto-updated and sourced from Leek Duck. ` +
+    `Local-time events are set for ${timezone}.`;
+
+  // Only the calendar's own properties, not those of its events.
+  const eventPosition = calendar.indexOf("BEGIN:VEVENT");
+
+  const header =
+    eventPosition === -1
+      ? calendar
+      : calendar.slice(0, eventPosition);
+
+  const setProperty = (
+    text: string,
+    property: string,
+    value: string,
+  ): string =>
+    text.replace(
+      new RegExp(`^${property}:.*(?:\\n[ \\t].*)*`, "m"),
+      () => foldLine(`${property}:${escapeText(value)}`),
+    );
+
+  let updated = header;
+
+  updated = setProperty(updated, "NAME", name);
+  updated = setProperty(updated, "X-WR-CALNAME", name);
+  updated = setProperty(updated, "DESCRIPTION", description);
+  updated = setProperty(updated, "X-WR-CALDESC", description);
+
+  return updated + calendar.slice(header.length);
+}
+
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/**
+ * RFC 5545 TEXT escaping.
+ */
+function escapeText(text: string): string {
+  return text.replace(
+    /[\\;,]/g,
+    (character) => `\\${character}`,
   );
 }
 
