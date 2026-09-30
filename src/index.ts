@@ -31,7 +31,7 @@ Special category all_day (see notes)	https://nit.ai/gocal.ics?exclude=all_day
 Just a few notes:
 
 As I mentioned, this isn't fully tested, so there might be some issues.
-'Exclude' and 'include' parameters can't be used together (not sure about the logic if both are used).
+'Exclude' and 'include' parameters can't refer to the same category
 I added a special category for 'exclude/include' called all_day, which filters all-day events across categories.
  */
  
@@ -170,9 +170,18 @@ export default {
       "exclude",
     );
 
-    if (include.length > 0 && exclude.length > 0) {
+    /*
+     * Both may be combined: keep events matching `include`, then
+     * drop those matching `exclude`. The same category in both
+     * would always give an empty calendar.
+     */
+    const overlap = include.filter((category) =>
+      exclude.includes(category),
+    );
+
+    if (overlap.length > 0) {
       return errorResponse(
-        "`include` and `exclude` cannot be used together.",
+        `Categories cannot be both included and excluded: ${overlap.join(", ")}`,
       );
     }
 
@@ -408,16 +417,18 @@ function filterEvents(
         eventTags,
       );
 
-      if (include.length > 0) {
-        return matchesAnyFilter(metadata, include)
-          ? event
-          : "";
+      if (
+        include.length > 0 &&
+        !matchesAnyFilter(metadata, include)
+      ) {
+        return "";
       }
 
-      if (exclude.length > 0) {
-        return matchesAnyFilter(metadata, exclude)
-          ? ""
-          : event;
+      if (
+        exclude.length > 0 &&
+        matchesAnyFilter(metadata, exclude)
+      ) {
+        return "";
       }
 
       return event;
@@ -1303,10 +1314,20 @@ function setCalendarName(
 
   if (include.length > 0) {
     selection = `In: ${names(include).join(", ")}`;
-    summary = `Only Pokémon GO events of type: ${sentenceList(include)}`;
-  } else if (exclude.length > 0) {
-    selection = `Ex: ${names(exclude).join(", ")}`;
-    summary = `All Pokémon GO events except ${sentenceList(exclude)}`;
+    summary = `Only Pokémon GO events of types: ${sentenceList(include)}`;
+  }
+
+  if (exclude.length > 0) {
+    // " | " rather than a comma, so the two lists stay apart.
+    selection =
+      include.length > 0
+        ? `${selection} | Ex: ${names(exclude).join(", ")}`
+        : `Ex: ${names(exclude).join(", ")}`;
+
+    summary =
+      include.length > 0
+        ? `${summary}, but not ${sentenceList(exclude)}`
+        : `All Pokémon GO events except types: ${sentenceList(exclude)}`;
   }
 
   const name = `GO - ${capitalize(selection)}`;
