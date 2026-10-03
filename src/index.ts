@@ -102,6 +102,7 @@ const categories = {
   ticketed_event: { prefix: "[TE]", name: "Ticketed Event" },
   ticketed: { prefix: "[T]", name: "Ticketed" },
   timed_research: { prefix: "[TR]", name: "Timed Research" },
+  twitch_drops: { prefix: "[TD]", name: "Twitch Drops" },
   update: { prefix: "[U]", name: "Update" },
   wild_area: { prefix: "[WA]", name: "Wild Area" },
   all_day: { prefix: "all_day", name: "All-day" },
