@@ -10,146 +10,119 @@ import worker from "../src/index";
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
 /*
- * Fixtures: a small go-calendar feed, the matching ScrapedDuck data
- * and Leek Duck event pages. All outbound fetches are mocked, so the
- * tests never touch the network.
+ * Fixtures: ScrapedDuck's events and the matching Leek Duck event
+ * pages. All outbound fetches are mocked, so the tests never touch
+ * the network.
  */
 
-// Naive RFC 5545 folding; fixtures are ASCII only.
-function fold(line: string): string {
-	const parts = [line.slice(0, 75)];
-
-	for (let i = 75; i < line.length; i += 74) {
-		parts.push(` ${line.slice(i, i + 74)}`);
-	}
-
-	return parts.join("\r\n");
-}
-
 interface FixtureEvent {
-	uid: string;
-	summary: string;
-	description: string;
-	start: string;
-	end: string;
-}
-
-function vevent(event: FixtureEvent): string {
-	const date = (property: string, value: string): string =>
-		/^\d{8}$/.test(value)
-			? `${property};VALUE=DATE:${value}`
-			: `${property}:${value}`;
-
-	return [
-		"BEGIN:VEVENT",
-		`UID:${event.uid}`,
-		"DTSTAMP:20260930T040000Z",
-		fold(`SUMMARY:${event.summary}`),
-		fold(`DESCRIPTION:${event.description}`),
-		date("DTSTART", event.start),
-		date("DTEND", event.end),
-		"BEGIN:VALARM",
-		"ACTION:DISPLAY",
-		fold(`DESCRIPTION:${event.summary}`),
-		"TRIGGER:-PT15M",
-		"END:VALARM",
-		"END:VEVENT",
-	].join("\r\n");
+	eventID: string;
+	name: string;
+	eventType: string;
+	heading: string;
+	start: string | null;
+	end: string | null;
 }
 
 const EVENTS: FixtureEvent[] = [
 	{
-		// Global, multi-day: all-day, with UTC times in the text.
-		uid: "gbl-week",
-		summary: "[GBL] Great League",
-		description: "Starts at 20:00\\, ends at 20:00.\\n\\nhttps://leekduck.com/events/gbl-week/",
-		start: "20260915",
-		end: "20260923",
+		// Global, multi-day: all-day.
+		eventID: "gbl-week",
+		name: "Great League",
+		eventType: "go-battle-league",
+		heading: "GO Battle League",
+		start: "2026-09-15T20:00:00.000Z",
+		end: "2026-09-22T20:00:00.000Z",
 	},
 	{
-		uid: "patterns-of-the-wild-2026",
-		summary: "[E] Patterns of the Wild",
-		description: "Starts at 10:00\\, ends at 20:00.",
-		start: "20261002T100000",
-		end: "20261002T200000",
+		eventID: "patterns-of-the-wild-2026",
+		name: "Patterns of the Wild",
+		eventType: "event",
+		heading: "Event",
+		start: "2026-10-02T10:00:00.000",
+		end: "2026-10-02T20:00:00.000",
 	},
 	{
-		uid: "harvest-festival",
-		summary: "[E] Harvest Festival",
-		description: "Starts at 10:00\\, ends at 20:00.",
-		start: "20261005T100000",
-		end: "20261005T200000",
+		eventID: "harvest-festival",
+		name: "Harvest Festival",
+		eventType: "event",
+		heading: "Event",
+		start: "2026-10-05T10:00:00.000",
+		end: "2026-10-05T20:00:00.000",
 	},
 	{
-		// Local, multi-day: all-day, with local times in the text.
-		uid: "season-24",
-		summary: "[S] Twilight Trails",
-		description: "Starts at 10:00\\, ends at 10:00.",
-		start: "20260908",
-		end: "20261202",
+		// Local, multi-day: all-day.
+		eventID: "season-24",
+		name: "Twilight Trails",
+		eventType: "season",
+		heading: "Season",
+		start: "2026-09-08T10:00:00.000",
+		end: "2026-12-01T10:00:00.000",
 	},
 	{
 		// After the EU clock change on 25 Oct (UTC+1).
-		uid: "research-day-1",
-		summary: "[RD] Research Day",
-		description: "Starts at 14:00\\, ends at 17:00.",
-		start: "20261103T140000",
-		end: "20261103T170000",
+		eventID: "research-day-1",
+		name: "Research Day",
+		eventType: "research-day",
+		heading: "Research Day",
+		start: "2026-11-03T14:00:00.000",
+		end: "2026-11-03T17:00:00.000",
 	},
 	{
-		uid: "raid-day-1",
-		summary: "[RD] Super Mega Raid Day",
-		description: "Starts at 14:00\\, ends at 17:00.",
-		start: "20261010T140000",
-		end: "20261010T170000",
+		eventID: "raid-day-1",
+		name: "Super Mega Raid Day",
+		eventType: "raid-day",
+		heading: "Raid Day",
+		start: "2026-10-10T14:00:00.000",
+		end: "2026-10-10T17:00:00.000",
 	},
 	{
-		uid: "max-monday-1",
-		summary: "[MM] Dynamax Sobble during Max Monday",
-		description: "Starts at 18:00\\, ends at 19:00.",
-		start: "20261005T180000",
-		end: "20261005T190000",
+		eventID: "max-monday-1",
+		name: "Dynamax Sobble during Max Monday",
+		eventType: "max-mondays",
+		heading: "Max Mondays",
+		start: "2026-10-05T18:00:00.000",
+		end: "2026-10-05T19:00:00.000",
 	},
 	{
-		// Not in ScrapedDuck: only the prefix can categorize it.
-		uid: "old-community-day",
-		summary: "[CD] Old Community Day",
-		description: "Starts at 14:00\\, ends at 17:00.",
-		start: "20260801T140000",
-		end: "20260801T170000",
+		// Global, timed.
+		eventID: "global-hour",
+		name: "Global Hour",
+		eventType: "event",
+		heading: "Event",
+		start: "2026-10-07T17:00:00.000Z",
+		end: "2026-10-07T18:00:00.000Z",
+	},
+	{
+		// A type we have no category for yet.
+		eventID: "mystery-1",
+		name: "Mystery, Revealed",
+		eventType: "mystery-thing",
+		heading: "Mystery Thing",
+		start: "2026-10-08T10:00:00.000",
+		end: "2026-10-08T12:00:00.000",
+	},
+	{
+		// Over: Leek Duck no longer gives its times.
+		eventID: "ended-raid-hour",
+		name: "Ended Raid Hour",
+		eventType: "raid-hour",
+		heading: "Raid Hour",
+		start: null,
+		end: null,
 	},
 ];
 
-const UPSTREAM_ICS = [
-	"BEGIN:VCALENDAR",
-	"VERSION:2.0",
-	"PRODID:spatie/icalendar-generator",
-	"NAME:GO Calendar - Everything",
-	"X-WR-CALNAME:GO Calendar - Everything",
-	fold("DESCRIPTION:All Pokémon GO events\\, in your local time\\, auto-updated and sourced from Leek Duck."),
-	fold("X-WR-CALDESC:All Pokémon GO events\\, in your local time\\, auto-updated and sourced from Leek Duck."),
-	"REFRESH-INTERVAL;VALUE=DURATION:PT1440M",
-	...EVENTS.map(vevent),
-	"END:VCALENDAR",
-	"",
-].join("\r\n");
+// The events that make it into the calendar.
+const SHOWN = EVENTS.filter((event) => event.start).map(
+	(event) => event.eventID,
+);
 
-const SCRAPEDDUCK_EVENTS = [
-	["gbl-week", "go-battle-league", "2026-09-15T20:00:00.000Z", "2026-09-22T20:00:00.000Z"],
-	["patterns-of-the-wild-2026", "event", "2026-10-02T10:00:00.000", "2026-10-02T20:00:00.000"],
-	["harvest-festival", "event", "2026-10-05T10:00:00.000", "2026-10-05T20:00:00.000"],
-	["season-24", "season", "2026-09-08T10:00:00.000", "2026-12-01T10:00:00.000"],
-	["research-day-1", "research-day", "2026-11-03T14:00:00.000", "2026-11-03T17:00:00.000"],
-	["raid-day-1", "raid-day", "2026-10-10T14:00:00.000", "2026-10-10T17:00:00.000"],
-	["max-monday-1", "max-mondays", "2026-10-05T18:00:00.000", "2026-10-05T19:00:00.000"],
-].map(([eventID, eventType, start, end]) => ({
-	eventID,
-	name: eventID,
-	eventType,
-	heading: eventType,
-	link: `https://leekduck.com/events/${eventID}/`,
-	start,
-	end,
+const SCRAPEDDUCK_EVENTS = EVENTS.map((event) => ({
+	...event,
+	link: `https://leekduck.com/events/${event.eventID}/`,
+	image: `https://cdn.leekduck.com/${event.eventID}.jpg`,
+	extraData: null,
 }));
 
 const PAGE_TAGS: Record<string, string[]> = {
@@ -160,6 +133,8 @@ const PAGE_TAGS: Record<string, string[]> = {
 	"research-day-1": ["research-day"],
 	"raid-day-1": ["raid-day"],
 	"max-monday-1": ["max-mondays"],
+	"global-hour": ["event"],
+	"mystery-1": ["mystery-thing"],
 };
 
 function leekDuckPage(tags: string[]): string {
@@ -176,12 +151,10 @@ function leekDuckPage(tags: string[]): string {
 }
 
 // Per-test knobs for the mocked outside world.
-let upstreamStatus: number;
 let scrapedDuckStatus: number;
 let leekDuckRequests: string[];
 
 beforeEach(async () => {
-	upstreamStatus = 200;
 	scrapedDuckStatus = 200;
 	leekDuckRequests = [];
 
@@ -191,10 +164,6 @@ beforeEach(async () => {
 	vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
 		const url =
 			input instanceof Request ? input.url : String(input);
-
-		if (url.includes("go-calendar/releases")) {
-			return new Response(UPSTREAM_ICS, { status: upstreamStatus });
-		}
 
 		if (url.includes("ScrapedDuck")) {
 			return new Response(JSON.stringify(SCRAPEDDUCK_EVENTS), {
@@ -287,7 +256,8 @@ describe("responses", () => {
 		expect(response.headers.get("Content-Type")).toBe(
 			"text/calendar; charset=utf-8",
 		);
-		expect(uids(ics)).toHaveLength(EVENTS.length);
+		expect(ics).toMatch(/^BEGIN:VCALENDAR\r\nVERSION:2\.0\r\n/);
+		expect(ics).toMatch(/\r\nEND:VCALENDAR\r\n$/);
 		// CRLF only, lines of at most 75 octets.
 		expect(ics.replace(/\r\n/g, "")).not.toMatch(/\n/);
 
@@ -307,9 +277,35 @@ describe("responses", () => {
 		expect((await get("", { method: "POST" })).status).toBe(405);
 	});
 
-	it("returns 502 when go-calendar is unavailable", async () => {
-		upstreamStatus = 500;
+	it("returns 502 when ScrapedDuck is unavailable", async () => {
+		scrapedDuckStatus = 500;
 		expect((await get()).status).toBe(502);
+	});
+});
+
+describe("events", () => {
+	it("lists ScrapedDuck's events, skipping those without times", async () => {
+		expect(uids(await calendar())).toEqual(SHOWN);
+	});
+
+	it("carries the title, link, image and a reminder", async () => {
+		const block = eventBlock(await calendar(), "max-monday-1");
+
+		expect(block).toContain("SUMMARY:[MM] Dynamax Sobble during Max Monday\r\n");
+		expect(block).toContain(
+			"DESCRIPTION:Starts at 18:00\\, ends at 19:00.\\n\\nhttps://leekduck.com/events/max-monday-1/\r\n",
+		);
+		expect(block).toContain("URL:https://leekduck.com/events/max-monday-1/\r\n");
+		expect(block).toContain("IMAGE;VALUE=URI:https://cdn.leekduck.com/max-monday-1.jpg\r\n");
+		expect(block).toMatch(
+			/BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:\[MM\] Dynamax Sobble during Max Monday\r\nTRIGGER:-PT15M\r\nEND:VALARM/,
+		);
+	});
+
+	it("prefixes unknown types with their heading's acronym and escapes text", async () => {
+		expect(eventBlock(await calendar(), "mystery-1")).toContain(
+			"SUMMARY:[MT] Mystery\\, Revealed\r\n",
+		);
 	});
 });
 
@@ -345,7 +341,7 @@ describe("validation", () => {
 });
 
 describe("timezones", () => {
-	it("converts floating times to UTC, across the clock change", async () => {
+	it("sets local times in the timezone, across the clock change", async () => {
 		const ics = await calendar("?timezone=Europe/Brussels");
 
 		// 2 Oct: UTC+2.
@@ -356,10 +352,13 @@ describe("timezones", () => {
 		expect(eventBlock(ics, "research-day-1")).toContain(
 			"DTSTART:20261103T130000Z",
 		);
+		expect(eventBlock(ics, "research-day-1")).toContain(
+			"DESCRIPTION:Starts at 14:00\\, ends at 17:00.\\n",
+		);
 		expect(header(ics, "X-WR-TIMEZONE")).toBe("Europe/Brussels");
 	});
 
-	it("treats floating times as UTC by default", async () => {
+	it("treats local times as UTC by default", async () => {
 		const ics = await calendar();
 
 		expect(eventBlock(ics, "patterns-of-the-wild-2026")).toContain(
@@ -368,33 +367,42 @@ describe("timezones", () => {
 		expect(header(ics, "X-WR-TIMEZONE")).toBe("UTC");
 	});
 
-	it("rewrites UTC times in global all-day descriptions", async () => {
-		const ics = await calendar("?timezone=Europe/Brussels");
-
-		expect(eventBlock(ics, "gbl-week")).toContain(
-			"DESCRIPTION:Starts at 22:00\\, ends at 22:00 (Europe/Brussels).\\n\\nhttps://leekduck.com/events/gbl-week/",
+	it("keeps global times and describes them in the timezone", async () => {
+		const block = eventBlock(
+			await calendar("?timezone=Europe/Brussels"),
+			"global-hour",
 		);
-		// Local times are already right.
-		expect(eventBlock(ics, "season-24")).toContain(
-			"DESCRIPTION:Starts at 10:00\\, ends at 10:00.",
-		);
-	});
 
-	it("spells out dates when the local days differ from the all-day range", async () => {
-		const ics = await calendar("?timezone=Asia/Tokyo");
-
-		expect(eventBlock(ics, "gbl-week")).toContain(
-			"DESCRIPTION:Starts 16 Sep at 05:00\\, ends 23 Sep at 05:00 (Asia/Tokyo).",
+		expect(block).toContain("DTSTART:20261007T170000Z");
+		expect(block).toContain("DTEND:20261007T180000Z");
+		expect(block).toContain(
+			"DESCRIPTION:Starts at 19:00\\, ends at 20:00 (Europe/Brussels).\\n",
 		);
 	});
 
-	it("keeps descriptions unchanged when ScrapedDuck is unavailable", async () => {
-		scrapedDuckStatus = 500;
-		const ics = await calendar("?timezone=Europe/Brussels");
-
-		expect(eventBlock(ics, "gbl-week")).toContain(
-			"DESCRIPTION:Starts at 20:00\\, ends at 20:00.",
+	it("dates global all-day events by their local days", async () => {
+		const block = eventBlock(
+			await calendar("?timezone=Asia/Tokyo"),
+			"gbl-week",
 		);
+
+		// 15 Sep 20:00 UTC to 22 Sep 20:00 UTC is 16 to 23 Sep in Tokyo.
+		expect(block).toContain("DTSTART;VALUE=DATE:20260916\r\n");
+		expect(block).toContain("DTEND;VALUE=DATE:20260924\r\n");
+		expect(block).toContain(
+			"DESCRIPTION:Starts at 05:00\\, ends at 05:00 (Asia/Tokyo).\\n",
+		);
+	});
+
+	it("dates local all-day events as written", async () => {
+		const block = eventBlock(
+			await calendar("?timezone=Asia/Tokyo"),
+			"season-24",
+		);
+
+		expect(block).toContain("DTSTART;VALUE=DATE:20260908\r\n");
+		expect(block).toContain("DTEND;VALUE=DATE:20261202\r\n");
+		expect(block).toContain("DESCRIPTION:Starts at 10:00\\, ends at 10:00.\\n");
 	});
 });
 
@@ -411,29 +419,13 @@ describe("categories", () => {
 		]);
 	});
 
-	it("falls back to the prefix for events ScrapedDuck doesn't list", async () => {
-		expect(uids(await calendar("?include=community_day"))).toEqual([
-			"old-community-day",
-		]);
-	});
-
-	it("falls back to prefixes when ScrapedDuck is unavailable", async () => {
-		scrapedDuckStatus = 500;
-
-		// [RD] can only mean raid_day then.
-		expect(uids(await calendar("?include=raid_day"))).toEqual([
-			"research-day-1",
-			"raid-day-1",
-		]);
-	});
-
 	it("filters all-day events", async () => {
 		expect(uids(await calendar("?include=all_day"))).toEqual([
 			"gbl-week",
 			"season-24",
 		]);
 		expect(uids(await calendar("?exclude=all_day"))).toHaveLength(
-			EVENTS.length - 2,
+			SHOWN.length - 2,
 		);
 	});
 
@@ -448,7 +440,7 @@ describe("categories", () => {
 
 		expect(
 			uids(await calendar("?include=event&exclude=location_specific")),
-		).toEqual(["harvest-festival"]);
+		).toEqual(["harvest-festival", "global-hour"]);
 	});
 });
 
@@ -456,8 +448,8 @@ describe("Leek Duck page tags", () => {
 	it("stores page tags from the scheduled job", async () => {
 		await runScheduled();
 
-		// Every ScrapedDuck event once; not the one it doesn't list.
-		expect(leekDuckRequests.sort()).toEqual(Object.keys(PAGE_TAGS).sort());
+		// Every listed event once; not the one without times.
+		expect(leekDuckRequests.sort()).toEqual([...SHOWN].sort());
 
 		const stored = await env.EVENT_TAGS.get<
 			Record<string, { tags: string[] }>
@@ -487,9 +479,7 @@ describe("Leek Duck page tags", () => {
 			"event-tags",
 			"json",
 		);
-		expect(Object.keys(stored ?? {})).toHaveLength(
-			Object.keys(PAGE_TAGS).length,
-		);
+		expect(Object.keys(stored ?? {})).toHaveLength(SHOWN.length);
 	});
 
 	it("matches filters on page tags", async () => {
@@ -507,6 +497,7 @@ describe("Leek Duck page tags", () => {
 		expect(uids(await calendar("?include=event"))).toEqual([
 			"patterns-of-the-wild-2026",
 			"harvest-festival",
+			"global-hour",
 		]);
 	});
 
@@ -572,14 +563,6 @@ describe("calendar name and description", () => {
 		);
 		expect(header(ics, "X-WR-CALDESC")).toBe(
 			"Only Pokémon GO events of types: All-day\\, but not Location-specific\\, auto-updated and sourced from Leek Duck. Local-time events are set for Europe/Brussels.",
-		);
-	});
-
-	it("leaves event descriptions alone", async () => {
-		const ics = await calendar("?exclude=all_day");
-
-		expect(eventBlock(ics, "harvest-festival")).toContain(
-			"DESCRIPTION:Starts at 10:00\\, ends at 20:00.",
 		);
 	});
 });

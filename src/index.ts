@@ -34,14 +34,11 @@ As I mentioned, this isn't fully tested, so there might be some issues.
 'Exclude' and 'include' parameters can't refer to the same category
 I added a special category for 'exclude/include' called all_day, which filters all-day events across categories.
  */
- 
- const UPSTREAM_URL =
-  "https://github.com/othyn/go-calendar/releases/latest/download/gocal.ics";
 
 /*
- * The Leek Duck data go-calendar is generated from. Its `eventID`
- * equals the ICS UID, and its start/end end with `Z` for global
- * (UTC) events, which the ICS itself does not preserve.
+ * Leek Duck's events, as scraped by ScrapedDuck. Global events'
+ * start/end end with `Z` (UTC); local events have no offset and
+ * happen at that wall-clock time in every timezone.
  */
 const SCRAPEDDUCK_EVENTS_URL =
   "https://raw.githubusercontent.com/bigfoott/ScrapedDuck/data/events.json";
@@ -56,14 +53,13 @@ const EVENT_TAGS_KEY = "event-tags";
 const TAG_BATCH_SIZE = 10;
 const TAG_RECHECK_MS = 24 * 60 * 60 * 1000;
 
-const MONTH_NAMES = [
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
+// Events lasting this long or longer are shown as all-day.
+const ALL_DAY_MIN_MS = 2 * 24 * 60 * 60 * 1000;
 
 /*
- * prefix: go-calendar's title prefix (an acronym of Leek Duck's
- * heading). name: Leek Duck's heading, used in the calendar name.
+ * prefix: the title prefix, an acronym of Leek Duck's heading
+ * (as go-calendar, which this calendar used to be built from,
+ * made them). name: Leek Duck's heading, used in the calendar name.
  */
 const categories = {
   bonus_hour: { prefix: "[BH]", name: "Bonus Hour" },
@@ -92,7 +88,7 @@ const categories = {
   raid_hour: { prefix: "[RH]", name: "Raid Hour" },
   raid_weekend: { prefix: "[RW]", name: "Raid Weekend" },
   research_breakthrough: { prefix: "[RBT]", name: "Research Breakthrough" },
-  // Same prefix as raid_day; only told apart via ScrapedDuck's eventType.
+  // Same prefix as raid_day; told apart by ScrapedDuck's eventType.
   research_day: { prefix: "[RD]", name: "Research Day" },
   research: { prefix: "[R]", name: "Research" },
   safari_zone: { prefix: "[SZ]", name: "Safari Zone" },
@@ -125,17 +121,6 @@ interface StoredEventTags {
 
 type EventTagStore = Record<string, StoredEventTags>;
 
-interface GlobalEventTimes {
-  start: Date;
-  end: Date;
-}
-
-interface ScrapedDuckEvent {
-  type: string;
-  // Only set for global (UTC) events.
-  times: GlobalEventTimes | null;
-}
-
 interface ZonedParts {
   year: number;
   month: number;
@@ -143,6 +128,26 @@ interface ZonedParts {
   hour: number;
   minute: number;
   second: number;
+}
+
+interface EventTime {
+  // As ScrapedDuck writes it, without any timezone applied.
+  written: ZonedParts;
+  // Global (UTC) rather than local wall-clock time.
+  global: boolean;
+}
+
+interface LeekDuckEvent {
+  // Used as the ICS UID, as go-calendar did, so subscribers
+  // see updates rather than duplicates.
+  id: string;
+  name: string;
+  type: string;
+  heading: string;
+  link: string;
+  image: string;
+  start: EventTime;
+  end: EventTime;
 }
 
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
@@ -231,117 +236,64 @@ export default {
       );
     }
 
-    // Fetched in parallel; resolves to an empty map on failure.
-    const scrapedDuckPromise = fetchScrapedDuckEvents();
-    const eventTagsPromise = readEventTags(env);
+    const [events, eventTags] = await Promise.all([
+      fetchLeekDuckEvents(),
+      readEventTags(env),
+    ]);
 
-    let upstream: Response;
-
-    try {
-      upstream = await fetch(UPSTREAM_URL, {
-        headers: {
-          Accept: "text/calendar",
-          "User-Agent": "GO-Calendar-Cloudflare-Proxy",
-        },
-        redirect: "follow",
-
-        cf: {
-          cacheEverything: true,
-          cacheTtl: 900,
-        },
-      });
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : String(error);
-
+    if (!events) {
       return textResponse(
-        `Failed to fetch GO Calendar: ${message}`,
+        "Failed to fetch the Leek Duck events from ScrapedDuck.",
         502,
       );
     }
 
-    if (!upstream.ok) {
-      return textResponse(
-        `GO Calendar returned HTTP ${upstream.status}.`,
-        502,
-      );
-    }
+    const stamp = formatUtcIcsDate(new Date());
 
-    let calendar = await upstream.text();
+    const vevents = events.flatMap((event) => {
+      const metadata = getEventMetadata(event, eventTags);
 
-    // Work internally with LF.
-    calendar = calendar.replace(/\r\n/g, "\n");
+      if (
+        includedCategories.length > 0 &&
+        !matchesAnyFilter(metadata, includedCategories)
+      ) {
+        return [];
+      }
 
-    const scrapedDuckEvents = await scrapedDuckPromise;
-    const eventTags = await eventTagsPromise;
+      if (
+        excludedCategories.length > 0 &&
+        matchesAnyFilter(metadata, excludedCategories)
+      ) {
+        return [];
+      }
 
-    if (
-      includedCategories.length > 0 ||
-      excludedCategories.length > 0
-    ) {
-      calendar = filterEvents(
-        calendar,
-        includedCategories,
-        excludedCategories,
-        scrapedDuckEvents,
-        eventTags,
-      );
-    }
+      return renderEvent(event, metadata, timezone, stamp);
+    });
 
-    // After filtering, which still matches go-calendar's prefixes.
-    calendar = addTagPrefixes(
-      calendar,
-      scrapedDuckEvents,
-      eventTags,
-    );
-
-    /*
-     * go-calendar turns multi-day global events into all-day
-     * events and only keeps their UTC times in the description,
-     * e.g. "Starts at 20:00, ends at 20:00.". Rewrite those
-     * times into the requested timezone.
-     */
-    calendar = localizeGlobalEventDescriptions(
-      calendar,
-      timezone,
-      scrapedDuckEvents,
-    );
-
-    /*
-     * Convert floating local DATE-TIME values into UTC.
-     *
-     * Example for Europe/Brussels:
-     *
-     * DTSTART:20260912T140000
-     *
-     * becomes:
-     *
-     * DTSTART:20260912T120000Z
-     *
-     * Google Calendar can then interpret the event as an absolute
-     * instant without having to understand floating date-times.
-     */
-    calendar = convertFloatingTimesToUtc(
-      calendar,
-      timezone,
-    );
-
-    calendar = setCalendarTimezone(
-      calendar,
-      timezone,
-    );
-
-    calendar = setCalendarName(
-      calendar,
+    const { name, description } = describeCalendar(
       includedCategories,
       excludedCategories,
       timezone,
     );
 
-    // RFC 5545 uses CRLF line endings.
-    calendar = calendar.replace(/\n/g, "\r\n");
+    const calendar = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//gocal//Leek Duck events//EN",
+      `NAME:${escapeText(name)}`,
+      `X-WR-CALNAME:${escapeText(name)}`,
+      `DESCRIPTION:${escapeText(description)}`,
+      `X-WR-CALDESC:${escapeText(description)}`,
+      `X-WR-TIMEZONE:${timezone}`,
+      "REFRESH-INTERVAL;VALUE=DURATION:PT6H",
+      "X-PUBLISHED-TTL:PT6H",
+      ...vevents,
+      "END:VCALENDAR",
+      "",
+    ]
+      .map(foldLine)
+      // RFC 5545 uses CRLF line endings.
+      .join("\r\n");
 
     const headers = new Headers({
       "Content-Type":
@@ -402,107 +354,29 @@ function isCategory(
   return value in categories;
 }
 
-function filterEvents(
-  calendar: string,
-  include: Category[],
-  exclude: Category[],
-  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
-  eventTags: EventTagStore,
-): string {
-  return calendar.replace(
-    /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
-    (event) => {
-      const metadata = getEventMetadata(
-        event,
-        scrapedDuckEvents,
-        eventTags,
-      );
-
-      if (
-        include.length > 0 &&
-        !matchesAnyFilter(metadata, include)
-      ) {
-        return "";
-      }
-
-      if (
-        exclude.length > 0 &&
-        matchesAnyFilter(metadata, exclude)
-      ) {
-        return "";
-      }
-
-      return event;
-    },
-  );
-}
-
 function getEventMetadata(
-  event: string,
-  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
+  event: LeekDuckEvent,
   eventTags: EventTagStore,
 ): EventMetadata {
-  /*
-   * Unfold iCalendar continuation lines for inspection only.
-   * The original event string itself remains unchanged.
-   */
-  const unfolded = event.replace(/\n[ \t]/g, "");
-
-  const summaryMatch = unfolded.match(
-    /^SUMMARY(?:;[^:]*)?:(.*)$/m,
-  );
-
-  const summary = summaryMatch?.[1] ?? "";
-
-  const uid = unfolded.match(/^UID:(.*)$/m)?.[1];
-
-  const eventType = uid
-    ? scrapedDuckEvents.get(uid)?.type
-    : undefined;
-
-  /*
-   * Prefer ScrapedDuck's eventType: prefixes are ambiguous
-   * ([RD] is both Raid Day and Research Day). Fall back to the
-   * prefix for events ScrapedDuck no longer lists.
-   */
-  let category: Category | null = eventType
-    ? categoryForEventType(eventType)
-    : null;
-
-  if (!category) {
-    for (const [name, { prefix }] of Object.entries(
-      categories,
-    ) as Array<[Category, { prefix: string }]>) {
-      if (name === "all_day") {
-        continue;
-      }
-
-      if (summary.startsWith(prefix)) {
-        category = name;
-        break;
-      }
-    }
-  }
-
   /*
    * Leek Duck's tag classes are its eventType names, so they
    * map onto categories the same way.
    */
-  const tagCategories = (uid ? eventTags[uid]?.tags ?? [] : [])
+  const tagCategories = (eventTags[event.id]?.tags ?? [])
     .map(categoryForEventType)
     .filter((tag): tag is Category => tag !== null);
 
   /*
-   * An all-day DTSTART contains only YYYYMMDD,
-   * possibly together with VALUE=DATE.
+   * Measured on the times as written, so an event is all-day
+   * (or not) in every timezone alike.
    */
   const allDay =
-    /^DTSTART(?:;[^:]*)?:\d{8}$/m.test(
-      unfolded,
-    );
+    wallClockMs(event.end.written) -
+      wallClockMs(event.start.written) >=
+    ALL_DAY_MIN_MS;
 
   return {
-    category,
+    category: categoryForEventType(event.type),
     tagCategories,
     allDay,
   };
@@ -521,85 +395,6 @@ function categoryForEventType(
     : null;
 }
 
-/*
- * Adds a prefix for each page tag besides the event's own
- * category, e.g. "[E] Patterns of the Wild" becomes
- * "[E][LS] Patterns of the Wild". The alarm, whose DESCRIPTION
- * repeats the title, is updated to match.
- */
-function addTagPrefixes(
-  calendar: string,
-  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
-  eventTags: EventTagStore,
-): string {
-  return calendar.replace(
-    /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
-    (event) => {
-      const { category, tagCategories } = getEventMetadata(
-        event,
-        scrapedDuckEvents,
-        eventTags,
-      );
-
-      const extra = [...new Set(tagCategories)]
-        .filter((tag) => tag !== category)
-        .map((tag) => categories[tag].prefix);
-
-      if (extra.length === 0) {
-        return event;
-      }
-
-      const alarmPosition = event.indexOf("\nBEGIN:VALARM");
-
-      const eventProperties =
-        alarmPosition === -1
-          ? event
-          : event.slice(0, alarmPosition);
-
-      const alarms =
-        alarmPosition === -1
-          ? ""
-          : event.slice(alarmPosition);
-
-      // May be folded over several lines.
-      const summaryLine = eventProperties.match(
-        /^SUMMARY(?:;[^:]*)?:.*(?:\n[ \t].*)*/m,
-      )?.[0];
-
-      if (!summaryLine) {
-        return event;
-      }
-
-      const [, property, title] =
-        summaryLine
-          .replace(/\n[ \t]/g, "")
-          .match(/^(SUMMARY(?:;[^:]*)?:)(.*)$/) ?? [];
-
-      // Insert after go-calendar's own "[XX]" prefix, if any.
-      const taggedTitle = title.replace(
-        /^(\[[^\]]+\])? ?/,
-        (_, prefix: string = "") =>
-          `${prefix}${extra.join("")} `,
-      );
-
-      const taggedAlarms = alarms.replace(
-        /^(DESCRIPTION(?:;[^:]*)?:)(.*(?:\n[ \t].*)*)/gm,
-        (line, alarmProperty: string, value: string) =>
-          value.replace(/\n[ \t]/g, "") === title
-            ? foldLine(`${alarmProperty}${taggedTitle}`)
-            : line,
-      );
-
-      return (
-        eventProperties.replace(
-          summaryLine,
-          () => foldLine(`${property}${taggedTitle}`),
-        ) + taggedAlarms
-      );
-    },
-  );
-}
-
 function matchesAnyFilter(
   metadata: EventMetadata,
   filters: Category[],
@@ -614,6 +409,114 @@ function matchesAnyFilter(
       metadata.tagCategories.includes(filter)
     );
   });
+}
+
+/*
+ * The category's prefix plus one for each page tag besides it,
+ * e.g. "[E][LS] Patterns of the Wild".
+ */
+function eventTitle(
+  event: LeekDuckEvent,
+  { category, tagCategories }: EventMetadata,
+): string {
+  // Unknown types get an acronym of their heading, like the rest.
+  const own = category
+    ? categories[category].prefix
+    : event.heading
+      ? `[${acronym(event.heading)}]`
+      : "";
+
+  const extra = [...new Set(tagCategories)]
+    .filter((tag) => tag !== category)
+    .map((tag) => categories[tag].prefix);
+
+  const prefix = own + extra.join("");
+
+  return prefix ? `${prefix} ${event.name}` : event.name;
+}
+
+function acronym(text: string): string {
+  return text
+    .split(/[^\p{L}]+/u)
+    .filter(Boolean)
+    .map((word) => word[0])
+    .join("");
+}
+
+/**
+ * The VEVENT lines, unfolded. Global events' times are given in
+ * the requested timezone; local events keep their own times.
+ */
+function renderEvent(
+  event: LeekDuckEvent,
+  metadata: EventMetadata,
+  timezone: string,
+  stamp: string,
+): string[] {
+  const title = eventTitle(event, metadata);
+
+  const start = resolveTime(event.start, timezone);
+  const end = resolveTime(event.end, timezone);
+
+  const zone =
+    event.start.global && event.end.global
+      ? ` (${timezone})`
+      : "";
+
+  const description =
+    `Starts at ${formatTime(start.local)}, ends at ${formatTime(end.local)}${zone}.` +
+    (event.link ? `\n\n${event.link}` : "");
+
+  // All-day ranges end on the day after the last one shown.
+  const dates = metadata.allDay
+    ? [
+        `DTSTART;VALUE=DATE:${formatIcsDate(start.local)}`,
+        `DTEND;VALUE=DATE:${nextIcsDate(end.local)}`,
+      ]
+    : [
+        `DTSTART:${formatUtcIcsDate(start.instant)}`,
+        `DTEND:${formatUtcIcsDate(end.instant)}`,
+      ];
+
+  return [
+    "BEGIN:VEVENT",
+    `UID:${event.id}`,
+    `DTSTAMP:${stamp}`,
+    `SUMMARY:${escapeText(title)}`,
+    `DESCRIPTION:${escapeText(description)}`,
+    ...(event.link ? [`URL:${event.link}`] : []),
+    ...(event.image ? [`IMAGE;VALUE=URI:${event.image}`] : []),
+    ...dates,
+    "BEGIN:VALARM",
+    "ACTION:DISPLAY",
+    `DESCRIPTION:${escapeText(title)}`,
+    "TRIGGER:-PT15M",
+    "END:VALARM",
+    "END:VEVENT",
+  ];
+}
+
+/**
+ * The instant an event time happens in the timezone, and the
+ * wall-clock time there.
+ */
+function resolveTime(
+  time: EventTime,
+  timezone: string,
+): { instant: Date; local: ZonedParts } {
+  if (time.global) {
+    const instant = new Date(wallClockMs(time.written));
+
+    return {
+      instant,
+      local: getZonedParts(instant, timezone),
+    };
+  }
+
+  return {
+    instant: wallClockToUtc(time.written, timezone),
+    local: time.written,
+  };
 }
 
 async function readEventTags(
@@ -643,12 +546,14 @@ async function readEventTags(
 async function refreshEventTags(
   env: Env,
 ): Promise<void> {
-  const scrapedDuckEvents = await fetchScrapedDuckEvents();
+  const events = await fetchLeekDuckEvents();
 
   // Don't wipe the store because ScrapedDuck is unavailable.
-  if (scrapedDuckEvents.size === 0) {
+  if (!events || events.length === 0) {
     return;
   }
+
+  const eventIDs = events.map((event) => event.id);
 
   const stored =
     (await env.EVENT_TAGS.get<EventTagStore>(
@@ -660,7 +565,7 @@ async function refreshEventTags(
   const store: EventTagStore = {};
 
   // Drop events ScrapedDuck no longer lists.
-  for (const eventID of scrapedDuckEvents.keys()) {
+  for (const eventID of eventIDs) {
     if (stored[eventID]) {
       store[eventID] = stored[eventID];
     }
@@ -670,7 +575,7 @@ async function refreshEventTags(
     store[eventID]?.checkedAt ?? 0;
 
   // Never-checked events first (checkedAt 0), then the oldest.
-  const due = [...scrapedDuckEvents.keys()]
+  const due = eventIDs
     .filter(
       (eventID) =>
         checkedAt(eventID) < now - TAG_RECHECK_MS,
@@ -754,17 +659,15 @@ async function fetchLeekDuckTags(
 }
 
 /**
- * Maps ScrapedDuck eventID -> eventType, plus UTC start/end
- * for global events.
+ * ScrapedDuck's events, in its order. Events without a start or
+ * end (Leek Duck drops them once an event is over) are skipped.
  *
- * Never throws: if ScrapedDuck is unavailable the calendar is
- * served with its original descriptions and prefix-based
- * categories.
+ * Returns null when ScrapedDuck is unavailable.
  */
-async function fetchScrapedDuckEvents(): Promise<
-  Map<string, ScrapedDuckEvent>
+async function fetchLeekDuckEvents(): Promise<
+  LeekDuckEvent[] | null
 > {
-  const scrapedDuckEvents = new Map<string, ScrapedDuckEvent>();
+  let data: unknown;
 
   try {
     const response = await fetch(SCRAPEDDUCK_EVENTS_URL, {
@@ -780,167 +683,100 @@ async function fetchScrapedDuckEvents(): Promise<
     });
 
     if (!response.ok) {
-      return scrapedDuckEvents;
+      return null;
     }
 
-    const events: unknown = await response.json();
-
-    if (!Array.isArray(events)) {
-      return scrapedDuckEvents;
-    }
-
-    for (const event of events) {
-      const { eventID, eventType, start, end } = event ?? {};
-
-      if (
-        typeof eventID !== "string" ||
-        typeof eventType !== "string"
-      ) {
-        continue;
-      }
-
-      scrapedDuckEvents.set(eventID, {
-        type: eventType,
-        times:
-          isUtcTimestamp(start) && isUtcTimestamp(end)
-            ? { start: new Date(start), end: new Date(end) }
-            : null,
-      });
-    }
+    data = await response.json();
   } catch {
-    // Fall through with whatever was collected.
+    return null;
   }
 
-  return scrapedDuckEvents;
+  if (!Array.isArray(data)) {
+    return null;
+  }
+
+  const events: LeekDuckEvent[] = [];
+  const seen = new Set<string>();
+
+  for (const item of data) {
+    const {
+      eventID,
+      name,
+      eventType,
+      heading,
+      link,
+      image,
+      start,
+      end,
+    } = item ?? {};
+
+    if (
+      typeof eventID !== "string" ||
+      typeof name !== "string" ||
+      typeof eventType !== "string" ||
+      // Duplicate UIDs would clash in calendar apps.
+      seen.has(eventID)
+    ) {
+      continue;
+    }
+
+    const startTime = parseEventTime(start);
+    const endTime = parseEventTime(end);
+
+    if (!startTime || !endTime) {
+      continue;
+    }
+
+    seen.add(eventID);
+
+    events.push({
+      id: eventID,
+      name,
+      type: eventType,
+      heading: typeof heading === "string" ? heading : "",
+      link: typeof link === "string" ? link : "",
+      image: typeof image === "string" ? image : "",
+      start: startTime,
+      end: endTime,
+    });
+  }
+
+  return events;
 }
 
-function isUtcTimestamp(
+/**
+ * Parses "2026-10-02T10:00:00.000" (local) and
+ * "2026-09-15T20:00:00.000Z" (global).
+ */
+function parseEventTime(
   value: unknown,
-): value is string {
-  return (
-    typeof value === "string" &&
-    value.endsWith("Z") &&
-    !Number.isNaN(Date.parse(value))
+): EventTime | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const match = value.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(Z)?$/,
   );
-}
 
-function localizeGlobalEventDescriptions(
-  calendar: string,
-  timezone: string,
-  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
-): string {
-  if (scrapedDuckEvents.size === 0) {
-    return calendar;
+  if (!match) {
+    return null;
   }
 
-  return calendar.replace(
-    /BEGIN:VEVENT\n[\s\S]*?\nEND:VEVENT/g,
-    (event) =>
-      localizeEventDescription(
-        event,
-        timezone,
-        scrapedDuckEvents,
-      ),
-  );
-}
+  const [, year, month, day, hour, minute, second = "0", utc] =
+    match;
 
-function localizeEventDescription(
-  event: string,
-  timezone: string,
-  scrapedDuckEvents: Map<string, ScrapedDuckEvent>,
-): string {
-  const unfolded = event.replace(/\n[ \t]/g, "");
-
-  const uid = unfolded.match(/^UID:(.*)$/m)?.[1];
-  const times = uid ? scrapedDuckEvents.get(uid)?.times : undefined;
-
-  if (!times) {
-    return event;
-  }
-
-  // Timed events already carry exact times; only all-day ones lose them.
-  const startDate = unfolded.match(
-    /^DTSTART;VALUE=DATE:(\d{8})$/m,
-  )?.[1];
-
-  const endDate = unfolded.match(
-    /^DTEND;VALUE=DATE:(\d{8})$/m,
-  )?.[1];
-
-  if (!startDate || !endDate) {
-    return event;
-  }
-
-  /*
-   * Only look before the VALARM, whose DESCRIPTION is the summary.
-   * The property may be folded over several lines.
-   */
-  const alarmPosition = event.indexOf("\nBEGIN:VALARM");
-
-  const eventProperties =
-    alarmPosition === -1
-      ? event
-      : event.slice(0, alarmPosition);
-
-  const descriptionLine = eventProperties.match(
-    /^DESCRIPTION(?:;[^:]*)?:.*(?:\n[ \t].*)*/m,
-  )?.[0];
-
-  if (!descriptionLine) {
-    return event;
-  }
-
-  const description = descriptionLine
-    .replace(/\n[ \t]/g, "")
-    .match(
-      /^(DESCRIPTION(?:;[^:]*)?:)Starts at (\d{2}:\d{2})\\, ends at (\d{2}:\d{2})\.(.*)$/,
-    );
-
-  if (!description) {
-    return event;
-  }
-
-  const [, property, describedStart, describedEnd, rest] =
-    description;
-
-  /*
-   * Only rewrite when the text really holds the UTC times, so
-   * this becomes a no-op if go-calendar ever fixes it upstream.
-   */
-  if (
-    describedStart !== formatUtcTime(times.start) ||
-    describedEnd !== formatUtcTime(times.end)
-  ) {
-    return event;
-  }
-
-  const start = getZonedParts(times.start, timezone);
-  const end = getZonedParts(times.end, timezone);
-
-  /*
-   * The all-day range is exclusive, so the last day shown is
-   * the day before DTEND. When the local times fall on other
-   * days than the ones shown, spell out the dates too.
-   */
-  const datesMatch =
-    formatIcsDate(start) === startDate &&
-    formatIcsDate(end) === previousIcsDate(endDate);
-
-  const text = datesMatch
-    ? `Starts at ${formatTime(start)}\\, ends at ${formatTime(end)} (${timezone}).`
-    : `Starts ${formatDayMonth(start)} at ${formatTime(start)}\\, ends ${formatDayMonth(end)} at ${formatTime(end)} (${timezone}).`;
-
-  return event.replace(
-    descriptionLine,
-    foldLine(`${property}${text}${rest}`),
-  );
-}
-
-function formatUtcTime(date: Date): string {
-  const pad = (number: number): string =>
-    String(number).padStart(2, "0");
-
-  return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+  return {
+    written: {
+      year: Number(year),
+      month: Number(month),
+      day: Number(day),
+      hour: Number(hour),
+      minute: Number(minute),
+      second: Number(second),
+    },
+    global: utc === "Z",
+  };
 }
 
 function formatTime(parts: ZonedParts): string {
@@ -950,10 +786,6 @@ function formatTime(parts: ZonedParts): string {
   return `${pad(parts.hour)}:${pad(parts.minute)}`;
 }
 
-function formatDayMonth(parts: ZonedParts): string {
-  return `${parts.day} ${MONTH_NAMES[parts.month - 1]}`;
-}
-
 function formatIcsDate(parts: ZonedParts): string {
   const pad = (number: number): string =>
     String(number).padStart(2, "0");
@@ -961,13 +793,9 @@ function formatIcsDate(parts: ZonedParts): string {
   return `${parts.year}${pad(parts.month)}${pad(parts.day)}`;
 }
 
-function previousIcsDate(value: string): string {
+function nextIcsDate(parts: ZonedParts): string {
   const date = new Date(
-    Date.UTC(
-      Number(value.slice(0, 4)),
-      Number(value.slice(4, 6)) - 1,
-      Number(value.slice(6, 8)) - 1,
-    ),
+    Date.UTC(parts.year, parts.month - 1, parts.day + 1),
   );
 
   return formatUtcIcsDate(date).slice(0, 8);
@@ -1002,102 +830,37 @@ function foldLine(line: string): string {
 
   lines.push(current);
 
-  return lines.join("\n ");
+  return lines.join("\r\n ");
 }
 
-function convertFloatingTimesToUtc(
-  calendar: string,
-  timezone: string,
-): string {
-  /*
-   * Only properties that can contain event/recurrence
-   * date-times are transformed.
-   *
-   * DTSTAMP, CREATED and LAST-MODIFIED are intentionally
-   * untouched because they normally already represent
-   * absolute UTC instants.
-   */
-  const properties =
-    /^(DTSTART|DTEND|RECURRENCE-ID|EXDATE|RDATE)(;[^:]*)?:(.+)$/gm;
-
-  return calendar.replace(
-    properties,
-    (
-      line: string,
-      property: string,
-      parameters: string = "",
-      rawValue: string,
-    ): string => {
-      // Already has an explicit timezone.
-      if (/;TZID=/i.test(parameters)) {
-        return line;
-      }
-
-      // All-day DATE value.
-      if (/;VALUE=DATE(?:;|$)/i.test(parameters)) {
-        return line;
-      }
-
-      const values = rawValue.split(",");
-
-      let changed = false;
-
-      const converted = values.map((value) => {
-        // Already UTC.
-        if (/^\d{8}T\d{6}Z$/.test(value)) {
-          return value;
-        }
-
-        // Floating DATE-TIME.
-        if (/^\d{8}T\d{6}$/.test(value)) {
-          changed = true;
-
-          return floatingTimeToUtc(
-            value,
-            timezone,
-          );
-        }
-
-        return value;
-      });
-
-      if (!changed) {
-        return line;
-      }
-
-      return `${property}${parameters}:${converted.join(
-        ",",
-      )}`;
-    },
+/**
+ * The wall-clock components read as if they were UTC.
+ */
+function wallClockMs(parts: ZonedParts): number {
+  return Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
   );
 }
 
-function floatingTimeToUtc(
-  value: string,
+/**
+ * The instant a wall-clock time happens in a timezone.
+ */
+function wallClockToUtc(
+  parts: ZonedParts,
   timezone: string,
-): string {
-  const year = Number(value.slice(0, 4));
-  const month = Number(value.slice(4, 6));
-  const day = Number(value.slice(6, 8));
-
-  const hour = Number(value.slice(9, 11));
-  const minute = Number(value.slice(11, 13));
-  const second = Number(value.slice(13, 15));
-
+): Date {
   /*
    * First interpret the wall-clock components as UTC.
    *
    * We then calculate the timezone offset and subtract it
    * to obtain the actual UTC instant.
    */
-  const wallClockUtc = Date.UTC(
-    year,
-    month - 1,
-    day,
-    hour,
-    minute,
-    second,
-  );
+  const wallClockUtc = wallClockMs(parts);
 
   let offset = getTimeZoneOffset(
     new Date(wallClockUtc),
@@ -1123,27 +886,17 @@ function floatingTimeToUtc(
     result = wallClockUtc - offset;
   }
 
-  return formatUtcIcsDate(
-    new Date(result),
-  );
+  return new Date(result);
 }
 
 function getTimeZoneOffset(
   date: Date,
   timezone: string,
 ): number {
-  const parts = getZonedParts(date, timezone);
-
-  const representedAsUtc = Date.UTC(
-    parts.year,
-    parts.month - 1,
-    parts.day,
-    parts.hour,
-    parts.minute,
-    parts.second,
+  return (
+    wallClockMs(getZonedParts(date, timezone)) -
+    date.getTime()
   );
-
-  return representedAsUtc - date.getTime();
 }
 
 /**
@@ -1261,42 +1014,15 @@ function getSupportedTimeZones(): string[] {
   ];
 }
 
-function setCalendarTimezone(
-  calendar: string,
-  timezone: string,
-): string {
-  if (/^X-WR-TIMEZONE:/m.test(calendar)) {
-    return calendar.replace(
-      /^X-WR-TIMEZONE:.*$/m,
-      `X-WR-TIMEZONE:${timezone}`,
-    );
-  }
-
-  const eventPosition =
-    calendar.indexOf("BEGIN:VEVENT");
-
-  if (eventPosition === -1) {
-    return calendar;
-  }
-
-  return (
-    calendar.slice(0, eventPosition) +
-    `X-WR-TIMEZONE:${timezone}\n` +
-    calendar.slice(eventPosition)
-  );
-}
-
 /**
- * Replaces go-calendar's "GO Calendar - Everything" name and
- * description with ones that describe the filters, e.g.
- * "GO - Ex: Season, Research".
+ * A calendar name and description that describe the filters,
+ * e.g. "GO - Ex: Season, Research".
  */
-function setCalendarName(
-  calendar: string,
+function describeCalendar(
   include: Category[],
   exclude: Category[],
   timezone: string,
-): string {
+): { name: string; description: string } {
   const names = (list: Category[]): string[] =>
     list.map((category) => categories[category].name);
 
@@ -1331,38 +1057,12 @@ function setCalendarName(
         : `All Pokémon GO events except types: ${sentenceList(exclude)}`;
   }
 
-  const name = `GO - ${capitalize(selection)}`;
-
-  const description =
-    `${summary}, auto-updated and sourced from Leek Duck. ` +
-    `Local-time events are set for ${timezone}.`;
-
-  // Only the calendar's own properties, not those of its events.
-  const eventPosition = calendar.indexOf("BEGIN:VEVENT");
-
-  const header =
-    eventPosition === -1
-      ? calendar
-      : calendar.slice(0, eventPosition);
-
-  const setProperty = (
-    text: string,
-    property: string,
-    value: string,
-  ): string =>
-    text.replace(
-      new RegExp(`^${property}:.*(?:\\n[ \\t].*)*`, "m"),
-      () => foldLine(`${property}:${escapeText(value)}`),
-    );
-
-  let updated = header;
-
-  updated = setProperty(updated, "NAME", name);
-  updated = setProperty(updated, "X-WR-CALNAME", name);
-  updated = setProperty(updated, "DESCRIPTION", description);
-  updated = setProperty(updated, "X-WR-CALDESC", description);
-
-  return updated + calendar.slice(header.length);
+  return {
+    name: `GO - ${capitalize(selection)}`,
+    description:
+      `${summary}, auto-updated and sourced from Leek Duck. ` +
+      `Local-time events are set for ${timezone}.`,
+  };
 }
 
 function capitalize(text: string): string {
@@ -1373,10 +1073,9 @@ function capitalize(text: string): string {
  * RFC 5545 TEXT escaping.
  */
 function escapeText(text: string): string {
-  return text.replace(
-    /[\\;,]/g,
-    (character) => `\\${character}`,
-  );
+  return text
+    .replace(/[\\;,]/g, (character) => `\\${character}`)
+    .replace(/\r?\n/g, "\\n");
 }
 
 function errorResponse(
