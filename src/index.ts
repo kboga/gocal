@@ -28,6 +28,7 @@ List of valid categories shows if you type in a wrong one	https://nit.ai/gocal.i
 Include events (whitelist style)	https://nit.ai/gocal.ics?include=pokemon_spotlight_hour
 Timezone and filter combined	https://nit.ai/gocal.ics?timezone=America/Port-au-Prince&exclude=season&exclude=research
 Special category all_day (see notes)	https://nit.ai/gocal.ics?exclude=all_day
+Multi-day events as dates instead of times	https://nit.ai/gocal.ics?multiday=dates
 Just a few notes:
 
 As I mentioned, this isn't fully tested, so there might be some issues.
@@ -53,8 +54,16 @@ const EVENT_TAGS_KEY = "event-tags";
 const TAG_BATCH_SIZE = 10;
 const TAG_RECHECK_MS = 24 * 60 * 60 * 1000;
 
-// Events lasting this long or longer are shown as all-day.
+/*
+ * Events lasting this long or longer match the all_day filter,
+ * and are given as dates only with ?multiday=dates.
+ */
 const ALL_DAY_MIN_MS = 2 * 24 * 60 * 60 * 1000;
+
+// How multi-day events are written; the first is the default.
+const MULTIDAY_MODES = ["times", "dates"] as const;
+
+type MultidayMode = (typeof MULTIDAY_MODES)[number];
 
 /*
  * prefix: the title prefix, an acronym of Leek Duck's heading
@@ -236,6 +245,21 @@ export default {
       );
     }
 
+    const multiday =
+      url.searchParams.get("multiday") ?? MULTIDAY_MODES[0];
+
+    if (!isMultidayMode(multiday)) {
+      return errorResponse(
+        [
+          `Invalid multiday: ${multiday}`,
+          "",
+          "Valid values:",
+          "- times (default): real start and end times",
+          "- dates: events of 2 days or more as all-day dates",
+        ].join("\n"),
+      );
+    }
+
     const [events, eventTags] = await Promise.all([
       fetchLeekDuckEvents(),
       readEventTags(env),
@@ -267,7 +291,13 @@ export default {
         return [];
       }
 
-      return renderEvent(event, metadata, timezone, stamp);
+      return renderEvent(
+        event,
+        metadata,
+        timezone,
+        multiday,
+        stamp,
+      );
     });
 
     const { name, description } = describeCalendar(
@@ -346,6 +376,12 @@ function readMultiValueParameter(
         .filter(Boolean),
     ),
   ];
+}
+
+function isMultidayMode(
+  value: string,
+): value is MultidayMode {
+  return (MULTIDAY_MODES as readonly string[]).includes(value);
 }
 
 function isCategory(
@@ -446,11 +482,13 @@ function acronym(text: string): string {
 /**
  * The VEVENT lines, unfolded. Global events' times are given in
  * the requested timezone; local events keep their own times.
+ * With multiday "dates", multi-day events become all-day.
  */
 function renderEvent(
   event: LeekDuckEvent,
   metadata: EventMetadata,
   timezone: string,
+  multiday: MultidayMode,
   stamp: string,
 ): string[] {
   const title = eventTitle(event, metadata);
@@ -468,15 +506,16 @@ function renderEvent(
     (event.link ? `\n\n${event.link}` : "");
 
   // All-day ranges end on the day after the last one shown.
-  const dates = metadata.allDay
-    ? [
-        `DTSTART;VALUE=DATE:${formatIcsDate(start.local)}`,
-        `DTEND;VALUE=DATE:${nextIcsDate(end.local)}`,
-      ]
-    : [
-        `DTSTART:${formatUtcIcsDate(start.instant)}`,
-        `DTEND:${formatUtcIcsDate(end.instant)}`,
-      ];
+  const dates =
+    metadata.allDay && multiday === "dates"
+      ? [
+          `DTSTART;VALUE=DATE:${formatIcsDate(start.local)}`,
+          `DTEND;VALUE=DATE:${nextIcsDate(end.local)}`,
+        ]
+      : [
+          `DTSTART:${formatUtcIcsDate(start.instant)}`,
+          `DTEND:${formatUtcIcsDate(end.instant)}`,
+        ];
 
   return [
     "BEGIN:VEVENT",

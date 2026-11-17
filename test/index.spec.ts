@@ -330,6 +330,13 @@ describe("validation", () => {
 		expect(await response.text()).toContain("Invalid timezone: Mars/Base");
 	});
 
+	it("rejects unknown multiday values", async () => {
+		const response = await get("?multiday=weeks");
+
+		expect(response.status).toBe(400);
+		expect(await response.text()).toContain("Invalid multiday: weeks");
+	});
+
 	it("rejects a category that is both included and excluded", async () => {
 		const response = await get("?include=all_day&exclude=all_day");
 
@@ -380,9 +387,22 @@ describe("timezones", () => {
 		);
 	});
 
-	it("dates global all-day events by their local days", async () => {
+	it("gives multi-day events their real times by default", async () => {
 		const block = eventBlock(
-			await calendar("?timezone=Asia/Tokyo"),
+			await calendar("?timezone=Europe/Brussels"),
+			"gbl-week",
+		);
+
+		expect(block).toContain("DTSTART:20260915T200000Z\r\n");
+		expect(block).toContain("DTEND:20260922T200000Z\r\n");
+		expect(eventBlock(await calendar("?multiday=times"), "season-24")).toContain(
+			"DTSTART:20260908T100000Z\r\n",
+		);
+	});
+
+	it("dates global multi-day events by their local days", async () => {
+		const block = eventBlock(
+			await calendar("?timezone=Asia/Tokyo&multiday=dates"),
 			"gbl-week",
 		);
 
@@ -394,9 +414,9 @@ describe("timezones", () => {
 		);
 	});
 
-	it("dates local all-day events as written", async () => {
+	it("dates local multi-day events as written", async () => {
 		const block = eventBlock(
-			await calendar("?timezone=Asia/Tokyo"),
+			await calendar("?timezone=Asia/Tokyo&multiday=dates"),
 			"season-24",
 		);
 
